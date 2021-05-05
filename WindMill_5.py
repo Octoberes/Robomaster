@@ -24,6 +24,7 @@ import imutils
 import serial	#串口
 import scipy
 import gxipy as gx
+from PIL import Image
 #import queue
 #import numba
 #from numba import cuda
@@ -69,8 +70,8 @@ FocalLenth = 8
 #控制X/Y轴的旋转
 X_Control = 0
 Y_Control = 0
-RotateAngle[2] = [0, 0]
-packed.gimbal_rotate = RotateAngle
+RotateAngle = [0, 0]
+#packed.gimbal_rotate = RotateAngle
 
 #cap = cam.data_stream[0].get_image()
 #frame = cap.convert("RGB")
@@ -94,6 +95,9 @@ H = None
 #输入输出的针脚
 #output_pin = 8
 #input_pin = 10
+
+global targetX, targetY
+targetX = targetY = 0
 
 def nothing(x):
 	pass
@@ -209,6 +213,7 @@ def matchTemplate(Thresholdgray, roi):
 
 def foresee(KnownWidth, D, FocalLenth, Rs, Angle):
 	#计算相机到目标的距离
+	#F = 2300
 	D2C = (KnownWidth * FocalLenth) / D		#KnowWidth = (D * D2C) / FocalLenth
 	#FocalLenth = D2C * D / KnowWidth
 	if (Angle + Rs) <= 360:
@@ -235,6 +240,7 @@ def formulaProjectile(X, Y, V, G):
 		return Theta1, T
 	else:
 		return 0, 0
+
 '''
 class serialPort():
 	def openSerialPort():
@@ -274,25 +280,6 @@ class serialPort():
 		#serial_port.write(x.encode('utf-8') for x in data)
 		serial_port.write((yawRotateAngel, pitchRotateAngle, shootOrder).encode('utf-8'))
 '''
-#class packed(self, RotateAngle, shoot_order):
-	#def __init__(self):
-		#self.gimbal_rotate = RotateAngle
-		#self.shoot_order = 0
-
-#def port(data):
-	#try:
-		#portx = "/dev/ttyTHS1"
-		#bps = 115200
-		#timex = 0.1
-		#ser = serial.Serial(portx, bps, timeout=timex)
-		
-		#ser.write(data.encode("utf-8"))
-		#result = ser.readline()
-		#print(result)
-		#ser.close()
-		#return result
-	#except Exception as e:
-		#print(e)
 
 #实例化质心跟踪器，然后初始化一个列表以存储每个dlib相关性跟踪器
 #然后初始化一个字典以将每个唯一对象ID映射到TrackableObject
@@ -336,7 +323,7 @@ class RealReadThread(threading.Thread):
 		# 通过序列号打开设备
 		self.cam = device_manager.open_device_by_sn(str_sn)
 		# set continuous acquisition
-		cam.TriggerMode.set(gx.GxSwitchEntry.OFF)
+		self.cam.TriggerMode.set(gx.GxSwitchEntry.OFF)
 		# 导入配置信息
 		# cam.import_config_file("./import_config_file.txt")
 		# 开始采集
@@ -345,12 +332,13 @@ class RealReadThread(threading.Thread):
 		# 帧率
 		#self.fps = cam.AcquisitionFrameRate.get()  
 		# 视频的宽高
-		self.size = (cam.Width.get(),cam.Height.get())
+		self.size = (self.cam.Width.get(),self.cam.Height.get())
 
 		cv2.namedWindow('origin', flags = cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO | cv2.WINDOW_GUI_EXPANDED)
 
-		while self.cap.isOpened():
-			print("Cap is Open")
+		#while self.cam.isOpened():
+		while True:
+			#print("Cap is Open")
 			#ret, frame = self.cap.read()
 			#if ret:
 				#print(" ")
@@ -358,30 +346,53 @@ class RealReadThread(threading.Thread):
 				#print("No Video")
 				#self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 				#ret, frame = self.cap.read()
-
-			self.cap = cam.data_stream[0].get_image()
-			if cap is None:
+			#time.sleep(0.1)
+			incomplete = 0
+			self.raw = self.cam.data_stream[0].get_image()
+			#cv2.waitKey(100)
+			if self.raw is None:
 				print("Getting image failed.")
+				self.cam.stream_off()
+				self.cam.close_device()
+				device_manager = gx.DeviceManager() 
+				dev_num, dev_info_list = device_manager.update_device_list()
+				if dev_num == 0:
+					sys.exit(1)
+				# 获取设备基本信息列表
+				str_sn = dev_info_list[0].get("sn")
+				# 通过序列号打开设备
+				self.cam = device_manager.open_device_by_sn(str_sn)
+				# set continuous acquisition
+				self.cam.TriggerMode.set(gx.GxSwitchEntry.OFF)
+				self.cam.stream_on()
 				continue
-			cap = self.cap.convert("RGB")
+
+			if self.raw.get_status() == gx.GxFrameStatusList.INCOMPLETE:
+				print("incomplete frame")
+				incomplete = 1
+				continue
+
+			cap = self.raw.convert("RGB")
 			if cap is None:
 				continue
 			frame = cap.get_numpy_array()
+			frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+			cv2.imshow('origin', frame)
 
 			lock.acquire()
-			if len(self._jobq) == 10:
+			if len(self._jobq) == 2:
 				self._jobq.popleft()
 			else:
 				self._jobq.append(frame)
 			lock.release()
-			cv2.imshow('origin', frame)
 
 			if cv2.waitKey(1) == ord('q'):
 				break
 		cv2.destroyWindow('origin')
 		self._jobq.clear()
-		cam.stream_off()
-		cam.close_device()
+		self.cam.stream_off()
+		self.cam.close_device()
 
 class GetThread(threading.Thread):
 	def __init__(self, input):
@@ -390,14 +401,19 @@ class GetThread(threading.Thread):
 		threading.Thread.__init__(self)
 		
 	def run(self):
-		cv2.namedWindow('res',flags=cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO | cv2.WINDOW_GUI_EXPANDED)
-
 		flag = False
 		while (True):
+			cv2.namedWindow('res',flags=cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO | cv2.WINDOW_GUI_EXPANDED)
+			print("-----------------------------------------------------------------------------------")
+			cv2.waitKey(1)
 			if len(self._jobq) != 0:
 				lock.acquire()
 				frame = self._jobq.pop()
 				lock.release()
+				#frame, incomplete = dat
+				dat = 0
+				if dat:
+					continue
 
 				global W, H
 				if W is None or H is None:
@@ -435,6 +451,8 @@ class GetThread(threading.Thread):
 					hierarchy = np.squeeze(hierarchy)
 					Total = totalFrames
 					for i, contour in enumerate(contours):
+						if i == 0:
+							continue
 						area = cv2.contourArea(contour)
 						rect = cv2.minAreaRect(contour)
 						box = cv2.boxPoints(rect)
@@ -456,11 +474,11 @@ class GetThread(threading.Thread):
 							#aspect_ratio = float(w)/h
 							aspect_ratio = w/h
 							if (aspect_ratio > 0.8) and (aspect_ratio < 1.2) and (area > 5):
-								print(">>>>>>>")
-								x = np.int(x)
-								y = np.int(y)
-								w = np.int(w)
-								h = np.int(h)
+								#print(">>>>>>>")
+								x = int(x)
+								y = int(y)
+								w = int(w)
+								h = int(h)
 								
 								#roi = thmask[x:x+w , y:y+h]
 								#global Rx, Ry
@@ -477,10 +495,10 @@ class GetThread(threading.Thread):
 
 									print(solidity)
 									global Ptx, Pty, Ptw, Pth
-									Ptx = np.int(x-w/2)
-									Pty = np.int(y-h/2)
-									Ptw = np.int(x+w/2)
-									Pth = np.int(y+h/2)
+									Ptx = int(x-w/2)
+									Pty = int(y-h/2)
+									Ptw = int(x+w/2)
+									Pth = int(y+h/2)
 
 									cv2.rectangle(res, (Ptx, Pty), (Ptw, Pth), (0,255,255), 2)
 									cv2.circle(res, (x, y), 4, (0, 255, 255), -1)
@@ -493,7 +511,6 @@ class GetThread(threading.Thread):
 									trackers.append(tracker)
 							
 							Total = Total + 1
-
 							continue
 
 						peri = cv2.arcLength(contour, True)
@@ -501,10 +518,10 @@ class GetThread(threading.Thread):
 						((x, y), (w, h), thtea) = cv2.minAreaRect(contour)
 
 						global Bx, By, Bw, Bh
-						Bx = np.int(x - w/2)
-						By = np.int(y - h/2)
-						Bw = np.int(x + w/2)
-						Bh = np.int(y + h/2)
+						Bx = int(x - w/2)
+						By = int(y - h/2)
+						Bw = int(x + w/2)
+						Bh = int(y + h/2)
 
 						if w < h:
 							q = w
@@ -529,7 +546,6 @@ class GetThread(threading.Thread):
 							solidity = float(area)/hull_area
 	
 							if ((solidity > 75) and (solidity < 300)) or ((solidity > 0.75) and (solidity < 3)):
-	
 								if hierarchy[i][2] != -1:		#检测是否为父级
 									print("该轮廓是父级")
 	
@@ -538,8 +554,8 @@ class GetThread(threading.Thread):
 										font = cv2.FONT_HERSHEY_DUPLEX
 										cX = x
 										cY = y
-										cX = np.int(cX)
-										cY = np.int(cY)
+										cX = int(cX)
+										cY = int(cY)
 										name = i
 										cv2.putText(res, '%s'%(name), (cX, cY), font, 1, (0, 255, 255), 1)
 	
@@ -566,7 +582,7 @@ class GetThread(threading.Thread):
 										start = time.time()
 										Scr = Angle
 										#KnownWidth, D, FocalLenth, Rs, Angle
-										D2C, ForeseeAngle = foresee(750, D, 8, Rs, Angle)
+										D2C, ForeseeAngle = foresee(750, D, 2300, Rs, Angle)
 										radian = ForeseeAngle * math.pi / 180
 										Fx = math.cos(radian) * D
 										Fy = math.sin(radian) * D
@@ -613,7 +629,7 @@ class GetThread(threading.Thread):
 				dst = cv2.cornerHarris(blur, 2, 3, 0.04)
 				#res[dst > 0.01 * dst.max()] = [0, 255, 0]
 				#cv2.imshow("HarrisCorner Detection", img)
-
+				global centroid, targetX, targetY
 				for (objectID, centroid) in objects.items():
 
 					to = trackableObjects.get(objectID, None)
@@ -622,9 +638,13 @@ class GetThread(threading.Thread):
 						to = TrackableObject(objectID, centroid)
 
 					else:
+						x = [u[0] for u in to.centroids]
 						y = [c[1] for c in to.centroids]
 						direction = centroid[1] - np.mean(y)
 						to.centroids.append(centroid)
+
+						targetX = centroid[0]
+						targetY = centroid[1]
 
 					trackableObjects[objectID] = to
 
@@ -633,62 +653,107 @@ class GetThread(threading.Thread):
 						cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 2)
 					cv2.circle(res, (centroid[0], centroid[1]), 4, (0, 255, 0), -1)
 
-				global targetX, targetY, yawRotateAngel, pitchRotateAngle, canShootY, canShootX
-				targetX = centroid[0]
-				targetY = centroid[1]
+				global yawRotateAngel, pitchRotateAngle, canShootY, canShootX
+
 				canShootX = False
 				canShootY = False
 				yawRotateAngle = pitchRotateAngle = RotateAngle[0] = RotateAngle[1] = 0
 				WdithX = ((targetX - Sx) * D2C) / FocalLenth
+				if D2C:
+					if (targetX < Sx - tolerance):
+						yawRotateAngel = WdithX / D2C
+						#RotateAngle[0] = WdithX / D2C
 
-				if (targetX < Sx - tolerance):
-					yawRotateAngel = WdithX / D2C
-					#RotateAngle[0] = WdithX / D2C
+					elif (targetX > Sx + tolerance):
+						yawRotateAngel = WdithX / D2C
+						#RotateAngle[0] = WdithX / D2C
 
-				elif (targetX > Sx + tolerance):
-					yawRotateAngel = WdithX / D2C
-					#RotateAngle[0] = WdithX / D2C
+					else:
+						canShootX = True
 
-				else:
-					canShootX = True
+					if (targetY < Sy - tolerance):
+						pitchRotateAngle = Fy / D2C
+						#RotateAngle[1] = Fy / D2C
 
-				if (targetY < Sy - tolerance):
-					pitchRotateAngle = Fy / D2C
-					#RotateAngle[1] = Fy / D2C
+					elif (targetY > Sy + tolerance):
+						pitchRotateAngle = Fy / D2C
+						#RotateAngle[1] = Fy / D2C
 
-				elif (targetY > Sy + tolerance):
-					pitchRotateAngle = Fy / D2C
-					#RotateAngle[1] = Fy / D2C
+					else:
+						canShootY = True
 
-				else:
-					canShootY = True
+					if (canShootX and canShootY):
+						shootOrder = 1
+					else:
+						shootOrder = 0
 
-				if (canShootX and canShootY):
-					shootOrder = 1
-				else:
-					shootOrder = 0
+					#运算完毕，开始串口传输数据
+					try:
+						ser = serial.Serial(
+							port = "COM1",	#COM1	/dev/ttyTHS1
+							baudrate = 115200,
+							bytesize = serial.EIGHTBITS,
+							parity = serial.PARITY_NONE,
+							stopbits = serial.STOPBITS_ONE,
+							timeout = 0.01,
+							)
+						print("ser is open")
+						time.sleep(0.5)
 
-				#packed.gimbal_rotate = RotateAngle
-				#packed.shoot_order = 0
-				#serialPort.sendData(yawRotateAngel, pitchRotateAngle, shootOrder)
-				serialPort.sendData(yawRotateAngel)
-				serialPort.sendData(pitchRotateAngle)
-				serialPort.sendData(shootOrder)
+						#尝试发送数据
+						try:
+							SOF = (b'\xA0' b'\x05' b'\x00' b'\x8D' b'\xFC')
+							data = struct.pack("<2f1B", yawRotateAngel, pitchRotateAngle, shootOrder)
+							decodeData = binascii.b2a_hex(data).decode('utf-8')
+							#print("serial SEND RAWdata is: ", decodeData)
 
-				fps.update()
-				fps.stop()
-				#fps = cv2.dilate()
-				info = [
-					("FPS", "{:.2f}".format(fps.fps())),
-					("Distance", "{:.2f}".format(D)),
-					("Angle", "{:.2f}".format(Angle)),
-					("Status", status),
-				]
+							#CRC8校验
+							crc = crcmod.predefined.Crc('crc-8')
+							hexData = data.hex()
+							hexData =binascii.unhexlify(hexData)	#16进制转换
+							crc.update(hexData)
+							result = hex(crc.crcValue)				#得到校验结果
+							result = bytes.fromhex(result[2:])
+							print(binascii.b2a_hex(data).decode('utf-8'))
+							ser.write(data)
 
-				for (i, (k, v)) in enumerate(info):
-					text = "{}: {}".format(k, v)
-					cv2.putText(res, text, (10, H - ((i * 40) + 20)),
-						cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 2)
+						except Exception as e:
+							print("\033[31mserial write data has ERROR: \033[0m", e)
+
+						#如果缓冲区有数据就开始读取
+						if ser.inWaiting() > 0:
+							opClass = ReadFromSerial(ser)
+							if opClass.read_one_struct():
+								SerialReadData = opClass.readByte
+								print("struct Read Data:", SerialReadData)
+
+					except Exception as e:
+						print("\033[31mOpen SERIAL has ERROR:\033[0m", e)
+					finally:
+						ser.close()
+
+					#开始解析串口接收的数据
+					#----------------------------------------------------
+					#比赛时间（判断大小幅）（int，4）
+					#陀螺仪数据（判断当前姿态（3float，12）
+					#炮弹射速（判断子弹落点）（int，4）
+					#----------------------------------------------------
+					MatchTime, Carx, Cary, Carz, V = SerialReadData
+
+					fps.update()
+					fps.stop()
+					#fps = cv2.dilate()
+					info = [
+						("FPS", "{:.2f}".format(fps.fps())),
+						("Distance", "{:.2f}".format(D)),
+						("Angle", "{:.2f}".format(Angle)),
+						("Status", status),
+					]
+
+					for (i, (k, v)) in enumerate(info):
+						text = "{}: {}".format(k, v)
+						cv2.putText(res, text, (10, H - ((i * 40) + 20)),
+							cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 2)
 
 
 				#res[dst > 0.01 * dst.max()] = [0, 255, 0]
@@ -706,8 +771,11 @@ class GetThread(threading.Thread):
 
 				totalFrames += 1
 				flag = True
-			elif flag == True and len(self._jobq) == 0:
+
+			elif cv2.waitKey(1) == ord('q'):
 				break
+			elif flag == True and len(self._jobq) == 0:
+				continue
 
 if __name__ == '__main__':
 	q = deque([], 10)
