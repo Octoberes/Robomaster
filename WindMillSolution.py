@@ -62,6 +62,17 @@ from scipy.integrate import odeint		# 引入数值积分方法
 from collections import OrderedDict
 from collections import deque
 import matplotlib.pyplot as plt
+from pathlib import Path
+import torch
+import torch.backends.cudnn as cudnn
+from numpy import random
+from models.experimental import attempt_load
+from utils.datasets import LoadStreams, LoadImages
+from utils.general import check_img_size, check_requirements, non_max_suppression, apply_classifier, scale_coords, \
+	xyxy2xywh, strip_optimizer, set_logging, increment_path
+from utils.plots import plot_one_box
+from utils.torch_utils import select_device, load_classifier, time_synchronized
+
 
 os.system('')
 lock = threading.Lock()
@@ -95,34 +106,34 @@ class ReadFromSerial(object):
 
 	def read_one_struct(self):
 		self.read = False
-		while not self.read:
-			#从队列中读取一个字节
-			SOFByte = self.port.read(1)
-			#读取到帧头就继续往下读
-			if (SOFByte == b'\xa0'):
-				data = SOFByte + self.port.read(21)
-				DecodeData = binascii.b2a_hex(data).decode('utf-8')
-				#print("获取到的数据：", DecodeData)
+		#if not self.read:
+		#从队列中读取一个字节
+		SOFByte = self.port.read(1)
+		#读取到帧头就继续往下读
+		if (SOFByte == b'\xa0'):
+			data = SOFByte + self.port.read(21)
+			DecodeData = binascii.b2a_hex(data).decode('utf-8')
+			#print("获取到的数据：", DecodeData)
 
-				#CRC8校验
-				crc8 = crcmod.predefined.Crc('crc-8')
-				hexData = (data[2:]).hex()
-				hexData =binascii.unhexlify(hexData)	#16进制转换
-				crc8.update(hexData)
-				result = hex(crc8.crcValue)				#得到校验结果
-				#print("result:", result)				#Output
-				#如果校验结果和传输来的结果一致...
-				if (('0x' + data[1:2].hex()) == result):
-					self.read = True
-					#print("The result of CRC8 is currect")
-					#self.readByte = int(((data[2:]).hex()), 16)
-					self.readByte = struct.unpack("<1i3f1i", data[2:])
-					return True
-				else:
-					print("\033[33mThe result of CRC8 is not currect\033[0m")
-					return False
+			#CRC8校验
+			crc8 = crcmod.predefined.Crc('crc-8')
+			hexData = (data[2:]).hex()
+			hexData =binascii.unhexlify(hexData)	#16进制转换
+			crc8.update(hexData)
+			result = hex(crc8.crcValue)				#得到校验结果
+			#print("result:", result)				#Output
+			#如果校验结果和传输来的结果一致...
+			if (('0x' + data[1:2].hex()) == result):
+				self.read = True
+				#print("The result of CRC8 is currect")
+				#self.readByte = int(((data[2:]).hex()), 16)
+				self.readByte = struct.unpack("<1i3f1i", data[2:])
+				return True
 			else:
-				print("\033[33mIt's not the Start of data\033[0m")
+				print("\033[33mThe result of CRC8 is not currect\033[0m")
+				return False
+		else:
+			print("\033[33mIt's not the Start of data\033[0m")
 
 class CentroidTracker():
 	'''
@@ -281,158 +292,170 @@ class MathCalculation():
 		 α = arctan(——————————————————————)
 							  gx
 		'''
-		self.DELTA = math.pow(V, 4) - G*(G*X*X - 2*Y*V*V)
-		if self.DELTA >= 0:
-			self.Theta1 = math.atan(((V**2) + math.sqrt(self.DELTA)) / (G*X))
-			self.Theta2 = math.atan(((V**2) - math.sqrt(self.DELTA)) / (G*X))
-			if self.Theta1 > self.Theta2:
-				#取最小值
-				self.Theta1 = self.Theta2
+		if X != 0:
+			DELTA = math.pow(V, 4) - G*(G*X*X - 2*Y*V*V)
+			if DELTA >= 0:
+				Theta1 = math.atan(((V**2) + math.sqrt(DELTA)) / (G*X))
+				Theta2 = math.atan(((V**2) - math.sqrt(DELTA)) / (G*X))
+				if Theta1 > Theta2:
+					#取最小值
+					Theta1 = Theta2
 
-			T = X / (V*math.cos(self.Theta1))	#用抛物线水平运动方程计算飞行时间
-			return self.Theta1, self.T
+				T = X / (V*math.cos(Theta1))	#用抛物线水平运动方程计算飞行时间
+				return Theta1, T
+			else:
+				return 0, 0
 		else:
 			return 0, 0
 
-class RealReadThread(threading.Thread):
-	'''
-	实时读取相机画面并推送到另一线程
-	'''
-	def __init__(self, input):
-		super(RealReadThread).__init__()
-		self._jobq = input
-
-		#self.cap = cv2.VideoCapture(r'D:\Desktop\1\RM2019\WindMill(Blue+Swich_On).mp4')
-		#cv2.waitKey(1)
-		#self.cap = cv2.VideoCapture(r'D:\Desktop\1\RM2019\rm2020-_asm120.avi')
-		#self.cap = cv2.VideoCapture(r'D:\Desktop\1\RM2019\rm2020-_asm120.mp4')
-		#time.sleep(1.0)
-		#cv2.waitKey(1)
-		#self.cap.set(cv2.CAP_PROP_FPS, 24)
-
-		threading.Thread.__init__(self)
-
-	def run(self):
-		'''
-		开始运行，打开相机并开始串流
-		进行预设的画面处理并推送到线程
-		'''
-		# 打开设备
-		# 枚举设备
-		device_manager = gx.DeviceManager() 
-		dev_num, dev_info_list = device_manager.update_device_list()
-		if dev_num == 0:
-			sys.exit(1)
-		# 获取设备基本信息列表
-		str_sn = dev_info_list[0].get("sn")
-		# 通过序列号打开设备
-		self.cam = device_manager.open_device_by_sn(str_sn)
-		# set continuous acquisition
-		cam.TriggerMode.set(gx.GxSwitchEntry.OFF)
-		# 导入配置信息
-		# cam.import_config_file("./import_config_file.txt")
-		# 开始采集
-		self.cam.stream_on()
-
-		# 帧率
-		#self.fps = cam.AcquisitionFrameRate.get()  
-		# 视频的宽高
-		self.size = (cam.Width.get(),cam.Height.get())
-
-		cv2.namedWindow('origin', flags = cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO | cv2.WINDOW_GUI_EXPANDED)
-
-		while self.cap.isOpened():
-			print("Cap is Open")
-			#ret, frame = self.cap.read()
-			#if ret:
-				#print(" ")
-			#else:
-				#print("No Video")
-				#self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-				#ret, frame = self.cap.read()
-
-			self.cap = cam.data_stream[0].get_image()
-			if cap is None:
-				print("\033[31mGetting image failed.\033[0m")
-				continue
-			cap = self.cap.convert("RGB")
-			if cap is None:
-				continue
-			frame = cap.get_numpy_array()
-
-			lock.acquire()
-			if len(self._jobq) == 10:
-				self._jobq.popleft()
-			else:
-				self._jobq.append(frame)
-			lock.release()
-			cv2.imshow('origin', frame)
-
-			if cv2.waitKey(1) == ord('q'):
-				break
-		cv2.destroyWindow('origin')
-		self._jobq.clear()
-		cam.stream_off()
-		cam.close_device()
-
-class GetThread(threading.Thread):
 	'''
 	开始处理数据，进行一个目标的识别反馈
 	'''
-	def __init__(self, input):
-		super(GetThread).__init__()
-		self._jobq = input
-		threading.Thread.__init__(self)
 
-	def GetResult(self):
-		'''
-		获取深度学习的识别反馈，暂时略过
-		输出的四个函数为目标中央坐标和长宽（单位px）
-		'''
-		target = [targetX, targetY, wdith, high]
-		return targrt
+def Detect():
+	'''
+	获取深度学习的识别反馈，暂时略过
+	输出的四个函数为目标中央坐标和长宽（单位px）
+	'''
+	print("Dec")
+	save_img = False
+	save_txt = False
+	view_img = True
+	imgsz = 640
+	weights = r'C:\Users\14059\Downloads\yolov5-master\yolov5-master\best.pt'
+	project = "detect"
+	name = "exp"
+	exise_ok = True
+	global totalFrames
+	totalFrames = 0
+	#实例化质心跟踪器，然后初始化一个列表以存储每个dlib相关性跟踪器
+	#然后初始化一个字典以将每个唯一对象ID映射到TrackableObject
+	ct = CentroidTracker(maxDisappeared = 5, maxDistance = 50)
+	trackers = []
+	trackableObjects = {}
+	start = time.time()
+	fps = None
+	fps = FPS().start()
+	cv2.namedWindow('res',flags=cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO | cv2.WINDOW_GUI_EXPANDED)
+	flag = False
+	D2C = 1
+	#初始化数据
 
-	def TargetOffset(self):
-		'''
-		开始计算云台旋转角度（即旋转云台直到目标处于画面中央）
-		'''
+	CameraFocal = 2300	#F = (P * D) / W	焦距F = （相机拍照测得像素宽度P * 目标距离相机位置D） / 物体宽度W
+	CameraFOV = 20		#设置相机参数		D' = (W * F) / P
+	V = 12				#发射速度t_flight =2*u*math.sin(theta_radians)/g
+	KnownWidth = perWidth = 50
+	FocalLenth = 2300		#(8mm)
+	#控制X/Y轴的旋转
+	X_Control = 0
+	Y_Control = 0
+	tolerance = 1       #瞄准范围宽容度,越小越准确
+	G = 9.8				#设定重力常量
 
-		#实例化质心跟踪器，然后初始化一个列表以存储每个dlib相关性跟踪器
-		#然后初始化一个字典以将每个唯一对象ID映射到TrackableObject
-		ct = CentroidTracker(maxDisappeared = 5, maxDistance = 50)
-		trackers = []
-		trackableObjects = {}
-		start = time.time()
-		fps = None
-		fps = FPS().start()
+	# Directories
+	save_dir = Path(increment_path(Path(project) / name, exist_ok=True))  # increment run
+	(save_dir / 'labels' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
 
-		cv2.namedWindow('res',flags=cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO | cv2.WINDOW_GUI_EXPANDED)
-		flag = False
+	# Initialize
+	set_logging()
+	device = select_device()
+	half = device.type != 'cpu'  # half precision only supported on CUDA
 
-		#初始化数据
-		global totalFrames
-		totalFrames = 0
-		CameraFocal = 2.8	#F = (P * D) / W	焦距F = （相机拍照测得像素宽度P * 目标距离相机位置D） / 物体宽度W
-		CameraFOV = 82		#设置相机参数		D' = (W * F) / P
-		V = 0				#发射速度t_flight =2*u*math.sin(theta_radians)/g
-		KnownWidth = perWidth = D2C = 0
-		FocalLenth = 8		#(8mm)
-		#控制X/Y轴的旋转
-		X_Control = 0
-		Y_Control = 0
-		tolerance = 5       #瞄准范围宽容度,越小越准确
-		G = 9.8				#设定重力常量
+	# Load model
+	model = attempt_load(weights, map_location=device)  # load FP32 model
+	imgsz = check_img_size(imgsz, s=model.stride.max())  # check img_size
+	if half:
+		model.half()  # to FP16
 
-		#从队列管道中接收数据
-		while (True):
-			if (len(self._jobq) != 0):
-				lock.acquire()
-				frame = self._jobq.pop()
-				lock.release()
+	# Second-stage classifier
+	classify = False
+	if classify:
+		modelc = load_classifier(name='resnet101', n=2)  # initialize
+		modelc.load_state_dict(torch.load('weights/resnet101.pt', map_location=device)['model']).to(device).eval()
 
+	# Set Dataloader
+	vid_path, vid_writer = None, None
+	if True:
+		view_img = True
+		save_img = False
+		cudnn.benchmark = True  # set True to speed up constant image size inference
+		dataset = LoadStreams('1', img_size=imgsz)
+
+	# Get names and colors
+	names = model.module.names if hasattr(model, 'module') else model.names
+	colors = [[random.randint(0, 255) for _ in range(3)] for _ in names]
+
+	# Run inference
+	t0 = time.time()
+	img = torch.zeros((1, 3, imgsz, imgsz), device=device)  # init img
+	_ = model(img.half() if half else img) if device.type != 'cpu' else None  # run once
+	for path, img, im0s, vid_cap in dataset:
+		img = torch.from_numpy(img).to(device)
+		img = img.half() if half else img.float()  # uint8 to fp16/32
+		img /= 255.0  # 0 - 255 to 0.0 - 1.0
+		if img.ndimension() == 3:
+			img = img.unsqueeze(0)
+
+		# Inference
+		t1 = time_synchronized()
+		pred = model(img, augment=True)[0]
+
+		# Apply NMS
+		pred = non_max_suppression(pred, 0.25, 0.45, classes=0, agnostic=True)
+		t2 = time_synchronized()
+
+		# Apply Classifier
+		if classify:
+			pred = apply_classifier(pred, modelc, img, im0s)
+
+		# Process detections
+		for i, det in enumerate(pred):  # detections per image
+			if True:  # batch_size >= 1
+				p, s, im0, frame = path[i], '%g: ' % i, im0s[i].copy(), dataset.count
+			else:
+				p, s, im0, frame = path, '', im0s, getattr(dataset, 'frame', 0)
+
+			p = Path(p)  # to Path
+			save_path = str(save_dir / p.name)  # img.jpg
+			txt_path = str(save_dir / 'labels' / p.stem) + ('' if dataset.mode == 'image' else f'_{frame}')  # img.txt
+			s += '%gx%g ' % img.shape[2:]  # print string
+			gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
+			if len(det):
+				# Rescale boxes from img_size to im0 size
+				det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
+
+				# Print results
+				for c in det[:, -1].unique():
+					n = (det[:, -1] == c).sum()  # detections per class
+					s += f'{n} {names[int(c)]}s, '  # add to string
+
+				# Write results
+				for *xyxy, conf, cls in reversed(det):
+					if save_txt:  # Write to file
+						xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
+						line = (cls, *xywh, conf) if 1 else (cls, *xywh)  # label format
+						with open(txt_path + '.txt', 'a') as f:
+							f.write(('%g ' * len(line)).rstrip() % line + '\n')
+
+					if save_img or view_img:  # Add bbox to image
+						label = f'{names[int(cls)]} {conf:.2f}'
+						plot_one_box(xyxy, im0, label=label, color=colors[int(cls)], line_thickness=3)
+						xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4))).view(-1).tolist()
+						print('xywh:', xywh)
+
+
+				# -----------------------
+				
+				'''
+				开始计算云台旋转角度（即旋转云台直到目标处于画面中央）
+				'''
+
+				#从队列管道中接收数据
+				x, y, w, h = xywh
 				global FrameW, FrameH, targetX, targetY
-				if FrameW is None or FrameH is None:
-					(FrameH, FrameW) = frame.shape[:2]
+				FrameW = FrameH = 0
+				if FrameW and FrameH:
+					(FrameH, FrameW) = im0.shape[:2]
 				#获取屏幕分辨率以及中心点
 				ScreenX = FrameW / 2
 				ScreenY = FrameH / 2
@@ -441,46 +464,55 @@ class GetThread(threading.Thread):
 				status = "Waiting"
 				rects = []
 
-				if totalFrames % 50 == 0:
+				if totalFrames % 1 == 0:
 					'''
-					如果当前帧不为50的倍数就开始检测
-					即每50帧检测一次目标位置
+					如果当前帧不为10的倍数就开始检测
+					即每10帧检测一次目标位置
 					'''
 					status = "Detecting"
 					trackers = []
 					#从深度学习算法中获取目标在画面中的位置
-					trackers = GetResult(frame)
+					#xywh, im0, xyxy = Detect(frame, True)
 
 					#获取目标相对于相机的距离
-					D2C = (KnownWidth * FocalLenth) / D
+					D2C = (KnownWidth * FocalLenth) / w
+					D2C = 1 if D2C == 0 else D2C
 
 					#已知击打预瞄点，把炮台Z轴指向击打预瞄点，然后以重力方向为-Y轴，炮台正前方为X轴建立抛物线
 					#得到打击角度和飞行时间
-					ShootAngle, FlyTime = MathCalculation.formulaProjectile(D2C, Fy, V, G)
-					ShootAngle = ShootAngle * (180) / (math.pi)
-					print("ShootAngle = ", ShootAngle, "	FlyTime = ", FlyTime, "s", "	Fy = ", Fy)
+					Fy = (D2C * (300 - y)) / FocalLenth
+					Fx = (D2C * (x - 400)) / FocalLenth
+					#Fy = math.atan(Fy / (D2C * 646.465))
+					Fy = math.atan(Fy / D2C)
+					Fx = math.atan(Fx / D2C)
+					Fy = Fy * (180) / (math.pi)
+					Fx = Fx * (180) / (math.pi)
+					#ShootAngle, FlyTime = MathCalculation.formulaProjectile(D2C, Fy, V, G)
+					#ShootAngle = ShootAngle * (180) / (math.pi)
+					print("← ", Fx, " →", "	Fy = ", Fy, "	D2C = ", D2C)
 
-					cv2.circle(res, (X, Y), 10, (0, 255, 0), -1)
-					cv2.circle(res, (Fx, Fy), 5, (0, 255, 255), -1)
-					cv2.polylines(res, [hull], True, (255, 0, 0), 1)
-
+					cv2.circle(im0, (int(x), int(y)), 10, (0, 255, 0), -1)
+					#cv2.circle(res, (Fx, Fy), 5, (0, 255, 255), -1)
+					#cv2.polylines(res, [hull], True, (255, 0, 0), 1)
+					targetX = x
+					targetY = y
 					#传递参数给跟踪模块
-					box = np.array([cX, cY, cX + w, cY + h])
+					box = np.array([x, y, x + w, y + h])
 					(startX, startY, endX, endY) = box.astype("int")
 					tracker = dlib.correlation_tracker()
 					rect = dlib.rectangle(startX, startY, endX, endY)
-					tracker.start_track(final, rect)
+					tracker.start_track(im0, rect)
 					trackers.append(tracker)
 			
-				else:
+				elif trackers != []:
 					'''
-					如果当前帧不为50的倍数，就开始跟踪
+					如果当前帧不为10的倍数，就开始跟踪
 					该方法可以有效提高帧数，减少计算检测时间
 					'''
 					for tracker in trackers:
 						status = "Tracking"
 
-						tracker.update(res)
+						tracker.update(im0)
 						pos = tracker.get_position()
 
 						startX = int(pos.left())
@@ -491,29 +523,45 @@ class GetThread(threading.Thread):
 						rects.append((startX, startY, endX, endY))
 
 				objects = ct.update(rects)
+				global centroid
 
-				#判断目标在画面中心（瞄准点）的什么位置
-				targetX, targetY, wdith, high = trackers
+				for (objectID, centroid) in objects.items():
+					to = trackableObjects.get(objectID, None)
+
+					if to is None:
+						to = TrackableObject(objectID, centroid)
+
+					else:
+						y = [c[1] for c in to.centroids]
+						direction = centroid[1] - np.mean(y)
+						to.centroids.append(centroid)
+
+					trackableObjects[objectID] = to
+
+					text = "ID {}".format(objectID)
+					cv2.putText(im0, text, (centroid[0] - 10, centroid[1] - 10),
+						cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 2)
+					cv2.circle(im0, (centroid[0], centroid[1]), 4, (0, 255, 0), -1)
+					targetX = centroid[0]
+					targetY = centroid[1]
 
 				global yawRotateAngel, pitchRotateAngle, canShootY, canShootX
 				canShootX = False
 				canShootY = False
 				yawRotateAngle = pitchRotateAngle = 0
-				WdithX = ((targetX - Sx) * D2C) / FocalLenth
-
-				if (targetX < Sx - tolerance):
-					yawRotateAngel = WdithX / D2C
-				elif (targetX > Sx + tolerance):
-					yawRotateAngel = WdithX / D2C
+				#WdithX = ((targetX - ScreenX) * D2C) / FocalLenth
+				WdithX = targetX - ScreenX
+				HightY = ScreenY - targetY
+				if (abs(targetX - ScreenX) > tolerance):
+					yawRotateAngel = Fx
 				else:
 					canShootX = True
 				#-------------------------------------------
-				if (targetY < Sy - tolerance):
-					pitchRotateAngle = Fy / D2C
-				elif (targetY > Sy + tolerance):
-					pitchRotateAngle = Fy / D2C
+				if (abs(ScreenY - targetY) > tolerance):
+					pitchRotateAngle = Fy
 				else:
 					canShootY = True
+
 				if (canShootX and canShootY):
 					shootOrder = 1
 				else:
@@ -522,7 +570,7 @@ class GetThread(threading.Thread):
 				#运算完毕，开始串口传输数据
 				try:
 					ser = serial.Serial(
-						port = "/dev/ttyTHS1",	#COM1	/dev/ttyTHS1
+						port = "COM1",	#COM1	/dev/ttyTHS1
 						baudrate = 115200,
 						bytesize = serial.EIGHTBITS,
 						parity = serial.PARITY_NONE,
@@ -530,11 +578,11 @@ class GetThread(threading.Thread):
 						timeout = 0.01,
 						)
 					print("ser is open")
-					time.sleep(0.5)
+					time.sleep(0.01)
 
 					#尝试发送数据
 					try:
-						SOF = (b'\xa0')
+						SOF = (b'\xA0' b'\x05' b'\x00' b'\x8D' b'\xFC')
 						data = struct.pack("<2f1B", yawRotateAngel, pitchRotateAngle, shootOrder)
 						decodeData = binascii.b2a_hex(data).decode('utf-8')
 						#print("serial SEND RAWdata is: ", decodeData)
@@ -545,7 +593,11 @@ class GetThread(threading.Thread):
 						hexData =binascii.unhexlify(hexData)	#16进制转换
 						crc.update(hexData)
 						result = hex(crc.crcValue)				#得到校验结果
-						result = bytes.fromhex(result[2:])
+						if len(result) == 3:
+							result = bytes.fromhex('0' + result[2:])
+						else:
+							result = bytes.fromhex(result[2:])
+						print("Serial Send Data: ",  yawRotateAngel, pitchRotateAngle, shootOrder)
 						print(binascii.b2a_hex(SOF + result + data).decode('utf-8'))
 						ser.write(SOF + result + data)
 
@@ -565,45 +617,64 @@ class GetThread(threading.Thread):
 					ser.close()
 
 				#开始解析串口接收的数据
+				#----------------------------------------------------
 				#比赛时间（判断大小幅）（int，4）
 				#陀螺仪数据（判断当前姿态（3float，12）
 				#炮弹射速（判断子弹落点）（int，4）
-				MatchTime, Carx, Cary, Carz, V = SerialReadData
+				#----------------------------------------------------
+				#MatchTime, Carx, Cary, Carz, V = SerialReadData
 
 				fps.update()
 				fps.stop()
 				#fps = cv2.dilate()
 				info = [
 					("FPS", "{:.2f}".format(fps.fps())),
-					("Distance", "{:.2f}".format(D)),
-					("Angle", "{:.2f}".format(Angle)),
+					("Distance", "{:.2f}".format(D2C)),
+					("yawAngle", "{:.2f}".format(yawRotateAngel)),
+					("pitchAngle", "{:.2f}".format(pitchRotateAngle)),
 					("Status", status),
 				]
 
 				for (i, (k, v)) in enumerate(info):
 					text = "{}: {}".format(k, v)
-					cv2.putText(res, text, (10, H - ((i * 40) + 20)),
+					cv2.putText(im0, text, (10, 640 - ((i * 40) + 40)),
 						cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 2)
 
-				cv2.imshow("res", res)
-				cv2.imshow('origin', frame)
+				cv2.imshow("res", im0)
+				#cv2.imshow('origin', frame)
 
 				totalFrames += 1
-				flag = True
+				flag = True	
 
-			#退出方法
-			elif flag == True and len(self._jobq) == 0:
-				break
+			# Print time (inference + NMS)
+			print(f'{s}Done. ({t2 - t1:.3f}s)')
+
+			# Stream results
+			if view_img:
+				cv2.imshow(str(p), im0)
+
+			# Save results (image with detections)
+			if save_img:
+				cv2.imwrite(save_path, im0)
+
+	if save_txt or save_img:
+		s = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if save_txt else ''
+		print(f"Results saved to {save_dir}{s}")
+
+	print(f'Done. ({time.time() - t0:.3f}s)')
+
+	#退出方法
+	#elif flag == True and len(self._jobq) == 0:
+		#break
+
+	#if cv2.waitKey(1) == ord('q'):
+		#break
+	#cv2.destroyAllWindow()
 
 if __name__ == '__main__':
-	q = deque([], 10)
-	th1 = RealReadThread(q)
-	th2 = GetThread(q)
-	th1.start()
-	th2.start()
-
-	th1.join()
-	th2.join()
+	with torch.no_grad():
+		print("main")
+		Detect()
 
 #相机的可调参数
 '''
